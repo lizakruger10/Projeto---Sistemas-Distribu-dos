@@ -1,0 +1,114 @@
+networks:
+  bbs-network:
+    driver: bridge
+
+services:
+  broker:
+    build: ./broker
+    container_name: broker
+    networks:
+      - bbs-network
+
+  # Servidores Python
+  server_py_1:
+    build: ./python
+    container_name: server_py_1
+    command: python server.py
+    environment:
+      - SERVER_ID=server_py_1
+      - BROKER_ADDR=tcp://broker:5556
+      - DATA_DIR=/app/data
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  server_py_2:
+    build: ./python
+    container_name: server_py_2
+    command: python server.py
+    environment:
+      - SERVER_ID=server_py_2
+      - BROKER_ADDR=tcp://broker:5556
+      - DATA_DIR=/app/data
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  # Servidores Node.js
+  server_node_1:
+    build: ./node
+    container_name: server_node_1
+    command: node server.js
+    environment:
+      - SERVER_ID=server_node_1
+      - BROKER_ADDR=tcp://broker:5556
+      - DATA_DIR=/app/data
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  server_node_2:
+    build: ./node
+    container_name: server_node_2
+    command: node server.js
+    environment:
+      - SERVER_ID=server_node_2
+      - BROKER_ADDR=tcp://broker:5556
+      - DATA_DIR=/app/data
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  # Clientes / Bots Python
+  bot_py_1:
+    build: ./python
+    container_name: bot_py_1
+    command: python client_bot.py
+    environment:
+      - BOT_ID=sensor_clima_01
+      - BROKER_ADDR=tcp://broker:5555
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  bot_py_2:
+    build: ./python
+    container_name: bot_py_2
+    command: python client_bot.py
+    environment:
+      - BOT_ID=sensor_clima_02
+      - BROKER_ADDR=tcp://broker:5555
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  # Clientes / Bots Node.js
+  bot_node_1:
+    build: ./node
+    container_name: bot_node_1
+    command: node client_bot.js
+    environment:
+      - BOT_ID=radar_transito_01
+      - BROKER_ADDR=tcp://broker:5555
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
+
+  bot_node_2:
+    build: ./node
+    container_name: bot_node_2
+    command: node client_bot.js
+    environment:
+      - BOT_ID=radar_transito_02
+      - BROKER_ADDR=tcp://broker:5555
+    networks:
+      - bbs-network
+    depends_on:
+      - broker
