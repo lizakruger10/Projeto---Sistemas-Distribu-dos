@@ -9,7 +9,12 @@ services:
     networks:
       - bbs-network
 
-  # Servidores Python
+  proxy:
+    build: ./proxy
+    container_name: proxy
+    networks:
+      - bbs-network
+
   server_py_1:
     build: ./python
     container_name: server_py_1
@@ -17,11 +22,13 @@ services:
     environment:
       - SERVER_ID=server_py_1
       - BROKER_ADDR=tcp://broker:5556
+      - PROXY_PUB_ADDR=tcp://proxy:5557
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
   server_py_2:
     build: ./python
@@ -30,13 +37,14 @@ services:
     environment:
       - SERVER_ID=server_py_2
       - BROKER_ADDR=tcp://broker:5556
+      - PROXY_PUB_ADDR=tcp://proxy:5557
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
-  # Servidores Node.js
   server_node_1:
     build: ./node
     container_name: server_node_1
@@ -44,11 +52,13 @@ services:
     environment:
       - SERVER_ID=server_node_1
       - BROKER_ADDR=tcp://broker:5556
+      - PROXY_PUB_ADDR=tcp://proxy:5557
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
   server_node_2:
     build: ./node
@@ -57,13 +67,14 @@ services:
     environment:
       - SERVER_ID=server_node_2
       - BROKER_ADDR=tcp://broker:5556
+      - PROXY_PUB_ADDR=tcp://proxy:5557
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
-  # Clientes / Bots Python
   bot_py_1:
     build: ./python
     container_name: bot_py_1
@@ -71,10 +82,12 @@ services:
     environment:
       - BOT_ID=sensor_clima_01
       - BROKER_ADDR=tcp://broker:5555
+      - PROXY_SUB_ADDR=tcp://proxy:5558
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
   bot_py_2:
     build: ./python
@@ -83,12 +96,13 @@ services:
     environment:
       - BOT_ID=sensor_clima_02
       - BROKER_ADDR=tcp://broker:5555
+      - PROXY_SUB_ADDR=tcp://proxy:5558
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
-  # Clientes / Bots Node.js
   bot_node_1:
     build: ./node
     container_name: bot_node_1
@@ -96,10 +110,12 @@ services:
     environment:
       - BOT_ID=radar_transito_01
       - BROKER_ADDR=tcp://broker:5555
+      - PROXY_SUB_ADDR=tcp://proxy:5558
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
 
   bot_node_2:
     build: ./node
@@ -108,7 +124,9 @@ services:
     environment:
       - BOT_ID=radar_transito_02
       - BROKER_ADDR=tcp://broker:5555
+      - PROXY_SUB_ADDR=tcp://proxy:5558
     networks:
       - bbs-network
     depends_on:
       - broker
+      - proxy
