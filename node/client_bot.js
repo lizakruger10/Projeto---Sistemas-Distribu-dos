@@ -6,6 +6,17 @@ const BROKER_ADDR = process.env.BROKER_ADDR || 'tcp://broker:5555';
 const PROXY_SUB_ADDR = process.env.PROXY_SUB_ADDR || 'tcp://proxy:5558';
 
 const subscribedChannels = new Set();
+let lamportClock = 0;
+
+function updateLamport(recvClock) {
+  lamportClock = Math.max(lamportClock, recvClock || 0) + 1;
+}
+
+function incrementLamport() {
+  lamportClock += 1;
+  return lamportClock;
+}
+
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 
 function logEvent(action, msgData) {
@@ -14,6 +25,7 @@ function logEvent(action, msgData) {
   console.log(`[${timeStr}] [${BOT_ID}] [${action}]`);
   console.log(`Tipo: ${msgData.type || msgData.channel}`);
   console.log(`Origem: ${msgData.sender}`);
+  console.log(`Relogio Logico (Lamport): ${msgData.lamport_clock}`);
   console.log(`Timestamp: ${msgData.timestamp || msgData.timestamp_sent}`);
   console.log(`Payload: ${JSON.stringify(msgData.payload || msgData.text)}`);
   console.log('='.repeat(60));
@@ -24,6 +36,7 @@ async function startSubListener(subSocket) {
     try {
       const channel = topicBuf.toString();
       const msg = decode(msgBuf);
+      updateLamport(msg.lamport_clock);
       const recvTime = Math.floor(Date.now() / 1000);
       const timeStr = new Date().toISOString().split('T')[1].slice(0, 8);
 
@@ -32,6 +45,7 @@ async function startSubListener(subSocket) {
       console.log(`Canal: ${channel}`);
       console.log(`Autor: ${msg.sender}`);
       console.log(`Texto: ${msg.text}`);
+      console.log(`Lamport Clock: ${lamportClock}`);
       console.log(`Timestamp Envio: ${msg.timestamp_sent}`);
       console.log(`Timestamp Recebimento: ${recvTime}`);
       console.log('*'.repeat(60));
@@ -51,16 +65,19 @@ async function runBot() {
   startSubListener(subSocket).catch(console.error);
 
   async function sendRequest(reqType, payload) {
+    const clock = incrementLamport();
     const msg = {
       type: reqType,
       sender: BOT_ID,
       timestamp: Math.floor(Date.now() / 1000),
+      lamport_clock: clock,
       payload
     };
     logEvent('ENVIO', msg);
     await reqSocket.send(encode(msg));
     const [replyBuf] = await reqSocket.receive();
     const reply = decode(replyBuf);
+    updateLamport(reply.lamport_clock);
     logEvent('RECEBIMENTO', reply);
     return reply;
   }

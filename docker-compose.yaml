@@ -15,6 +15,12 @@ services:
     networks:
       - bbs-network
 
+  reference:
+    build: ./reference
+    container_name: reference
+    networks:
+      - bbs-network
+
   server_py_1:
     build: ./python
     container_name: server_py_1
@@ -23,12 +29,14 @@ services:
       - SERVER_ID=server_py_1
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
+      - REF_ADDR=tcp://reference:5559
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
       - proxy
+      - reference
 
   server_py_2:
     build: ./python
@@ -38,12 +46,14 @@ services:
       - SERVER_ID=server_py_2
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
+      - REF_ADDR=tcp://reference:5559
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
       - proxy
+      - reference
 
   server_node_1:
     build: ./node
@@ -53,12 +63,14 @@ services:
       - SERVER_ID=server_node_1
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
+      - REF_ADDR=tcp://reference:5559
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
       - proxy
+      - reference
 
   server_node_2:
     build: ./node
@@ -68,12 +80,14 @@ services:
       - SERVER_ID=server_node_2
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
+      - REF_ADDR=tcp://reference:5559
       - DATA_DIR=/app/data
     networks:
       - bbs-network
     depends_on:
       - broker
       - proxy
+      - reference
 
   bot_py_1:
     build: ./python

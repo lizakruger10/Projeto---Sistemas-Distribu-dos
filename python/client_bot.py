@@ -10,12 +10,23 @@ BROKER_ADDR = os.getenv("BROKER_ADDR", "tcp://broker:5555")
 PROXY_SUB_ADDR = os.getenv("PROXY_SUB_ADDR", "tcp://proxy:5558")
 
 subscribed_channels = set()
+lamport_clock = 0
+
+def update_lamport(recv_clock):
+    global lamport_clock
+    lamport_clock = max(lamport_clock, recv_clock) + 1
+
+def increment_lamport():
+    global lamport_clock
+    lamport_clock += 1
+    return lamport_clock
 
 def log_event(action, msg_data):
     print("=" * 60, flush=True)
     print(f"[{time.strftime('%H:%M:%S')}] [{BOT_ID}] [{action}]", flush=True)
     print(f"Tipo/Topico: {msg_data.get('type', msg_data.get('channel'))}", flush=True)
     print(f"Origem: {msg_data.get('sender')}", flush=True)
+    print(f"Relogio Logico (Lamport): {msg_data.get('lamport_clock')}", flush=True)
     print(f"Timestamp: {msg_data.get('timestamp', msg_data.get('timestamp_sent'))}", flush=True)
     print(f"Payload/Texto: {msg_data.get('payload', msg_data.get('text'))}", flush=True)
     print("=" * 60, flush=True)
@@ -32,12 +43,14 @@ def listen_sub():
         try:
             topic, raw_msg = sub_socket.recv_multipart()
             msg = msgpack.unpackb(raw_msg, raw=False)
+            update_lamport(msg.get("lamport_clock", 0))
             recv_time = int(time.time())
             print("*" * 60, flush=True)
             print(f"[{time.strftime('%H:%M:%S')}] [{BOT_ID}] [PUB_RECEIVED]", flush=True)
             print(f"Canal: {topic.decode('utf-8')}", flush=True)
             print(f"Autor: {msg.get('sender')}", flush=True)
             print(f"Texto: {msg.get('text')}", flush=True)
+            print(f"Lamport Clock: {lamport_clock}", flush=True)
             print(f"Timestamp Envio: {msg.get('timestamp_sent')}", flush=True)
             print(f"Timestamp Recebimento: {recv_time}", flush=True)
             print("*" * 60, flush=True)
@@ -47,16 +60,19 @@ def listen_sub():
 threading.Thread(target=listen_sub, daemon=True).start()
 
 def send_request(req_type, payload):
+    clock = increment_lamport()
     msg = {
         "type": req_type,
         "sender": BOT_ID,
         "timestamp": int(time.time()),
+        "lamport_clock": clock,
         "payload": payload
     }
     log_event("ENVIO", msg)
     req_socket.send(msgpack.packb(msg))
     raw_reply = req_socket.recv()
     reply = msgpack.unpackb(raw_reply, raw=False)
+    update_lamport(reply.get("lamport_clock", 0))
     log_event("RECEBIMENTO", reply)
     return reply
 
