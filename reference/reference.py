@@ -49,7 +49,7 @@ def main():
             server_list = [{"name": s, "rank": info["rank"]} for s, info in registered_servers.items()]
             reply_payload = {"status": "OK", "servers": server_list}
 
-        # 3. Heartbeat e Sincronização do Relógio Físico
+        # 3. Heartbeat (a partir da parte 4 não retorna mais a hora)
         elif req_type == "HEARTBEAT_REQ":
             server_name = payload.get("name", sender)
             if server_name in registered_servers:
@@ -61,10 +61,7 @@ def main():
                 }
                 next_rank += 1
 
-            reply_payload = {
-                "status": "OK",
-                "physical_time": int(time.time())
-            }
+            reply_payload = {"status": "OK"}
 
         else:
             reply_payload = {"status": "ERROR", "msg": "Requisicao desconhecida"}

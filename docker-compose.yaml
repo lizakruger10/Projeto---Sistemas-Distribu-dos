@@ -27,6 +27,9 @@ services:
     command: python server.py
     environment:
       - SERVER_ID=server_py_1
+      - PROXY_SUB_ADDR=tcp://proxy:5558
+      - PEER_PORT=5560
+      - CLOCK_SKEW=0
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
       - REF_ADDR=tcp://reference:5559
@@ -44,6 +47,9 @@ services:
     command: python server.py
     environment:
       - SERVER_ID=server_py_2
+      - PROXY_SUB_ADDR=tcp://proxy:5558
+      - PEER_PORT=5560
+      - CLOCK_SKEW=3
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
       - REF_ADDR=tcp://reference:5559
@@ -61,6 +67,9 @@ services:
     command: node server.js
     environment:
       - SERVER_ID=server_node_1
+      - PROXY_SUB_ADDR=tcp://proxy:5558
+      - PEER_PORT=5560
+      - CLOCK_SKEW=-2
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
       - REF_ADDR=tcp://reference:5559
@@ -78,6 +87,9 @@ services:
     command: node server.js
     environment:
       - SERVER_ID=server_node_2
+      - PROXY_SUB_ADDR=tcp://proxy:5558
+      - PEER_PORT=5560
+      - CLOCK_SKEW=5
       - BROKER_ADDR=tcp://broker:5556
       - PROXY_PUB_ADDR=tcp://proxy:5557
       - REF_ADDR=tcp://reference:5559

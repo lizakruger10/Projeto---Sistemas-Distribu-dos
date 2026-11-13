@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import threading
 import zmq
 import msgpack
 
@@ -9,6 +10,12 @@ BROKER_ADDR = os.getenv("BROKER_ADDR", "tcp://broker:5556")
 PROXY_PUB_ADDR = os.getenv("PROXY_PUB_ADDR", "tcp://proxy:5557")
 REF_ADDR = os.getenv("REF_ADDR", "tcp://reference:5559")
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+PROXY_SUB_ADDR = os.getenv("PROXY_SUB_ADDR", "tcp://proxy:5558")
+PEER_PORT = os.getenv("PEER_PORT", "5560")          # porta REP para comunicação servidor<->servidor
+CLOCK_SKEW = float(os.getenv("CLOCK_SKEW", "0"))    # defasagem inicial do relógio (para testar a sincronização)
+SERVERS_TOPIC = "servers"
+SYNC_EVERY = 15                                     # sincroniza o relógio a cada 15 mensagens
+PEER_TIMEOUT_MS = 2000
 
 os.makedirs(DATA_DIR, exist_ok=True)
 LOGINS_FILE = os.path.join(DATA_DIR, f"{SERVER_ID}_logins.json")
@@ -46,30 +53,46 @@ pub_socket.connect(PROXY_PUB_ADDR)
 ref_socket = context.socket(zmq.REQ)
 ref_socket.connect(REF_ADDR)
 
+# Parte 4: relógio físico ajustável (Berkeley) e coordenador eleito
+clock_offset = CLOCK_SKEW
+coordinator = None
+sync_counter = 0
+lamport_lock = threading.Lock()
+ref_lock = threading.Lock()
+election_lock = threading.Lock()
+
+def now_time():
+    return time.time() + clock_offset
+
+def now_ts():
+    return int(now_time())
+
 def update_lamport(recv_clock):
     global lamport_clock
-    lamport_clock = max(lamport_clock, recv_clock) + 1
+    with lamport_lock:
+        lamport_clock = max(lamport_clock, recv_clock) + 1
 
 def increment_lamport():
     global lamport_clock
-    lamport_clock += 1
-    return lamport_clock
+    with lamport_lock:
+        lamport_clock += 1
+        return lamport_clock
 
 def send_heartbeat():
-    global lamport_clock
     clock = increment_lamport()
     msg = {
         "type": "HEARTBEAT_REQ",
         "sender": SERVER_ID,
-        "timestamp": int(time.time()),
+        "timestamp": now_ts(),
         "lamport_clock": clock,
         "payload": {"name": SERVER_ID}
     }
-    ref_socket.send(msgpack.packb(msg))
-    raw_rep = ref_socket.recv()
+    with ref_lock:
+        ref_socket.send(msgpack.packb(msg))
+        raw_rep = ref_socket.recv()
     rep = msgpack.unpackb(raw_rep, raw=False)
     update_lamport(rep.get("lamport_clock", 0))
-    print(f"[{SERVER_ID}] Heartbeat enviado ao Servico de Referencia. Hora Fisica: {rep.get('payload', {}).get('physical_time')}", flush=True)
+    print(f"[{SERVER_ID}] Heartbeat enviado ao Servico de Referencia.", flush=True)
 
 # Obter Rank no início
 time.sleep(2)
@@ -77,7 +100,7 @@ increment_lamport()
 ref_socket.send(msgpack.packb({
     "type": "REGISTER_RANK_REQ",
     "sender": SERVER_ID,
-    "timestamp": int(time.time()),
+    "timestamp": now_ts(),
     "lamport_clock": lamport_clock,
     "payload": {"name": SERVER_ID}
 }))
@@ -95,6 +118,158 @@ def log_event(action, msg_data):
     print(f"Timestamp: {msg_data.get('timestamp')}", flush=True)
     print(f"Payload: {msg_data.get('payload')}", flush=True)
     print("=" * 60, flush=True)
+
+# ======================= PARTE 4: ELEIÇÃO E SINCRONIZAÇÃO =======================
+
+def peer_request(name, req_type, payload):
+    """REQ para outro servidor. Retorna a resposta ou None se indisponível."""
+    sock = context.socket(zmq.REQ)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.RCVTIMEO, PEER_TIMEOUT_MS)
+    sock.setsockopt(zmq.SNDTIMEO, PEER_TIMEOUT_MS)
+    try:
+        sock.connect(f"tcp://{name}:{PEER_PORT}")
+        msg = {
+            "type": req_type,
+            "sender": SERVER_ID,
+            "timestamp": now_ts(),
+            "lamport_clock": increment_lamport(),
+            "payload": payload
+        }
+        log_event("ENVIO", msg)
+        sock.send(msgpack.packb(msg))
+        rep = msgpack.unpackb(sock.recv(), raw=False)
+        update_lamport(rep.get("lamport_clock", 0))
+        log_event("RECEBIMENTO", rep)
+        return rep
+    except zmq.ZMQError:
+        print(f"[{SERVER_ID}] Servidor '{name}' indisponivel ({req_type}).", flush=True)
+        return None
+    finally:
+        sock.close()
+
+def ref_list_servers():
+    with ref_lock:
+        ref_socket.send(msgpack.packb({
+            "type": "LIST_SERVERS_REQ",
+            "sender": SERVER_ID,
+            "timestamp": now_ts(),
+            "lamport_clock": increment_lamport(),
+            "payload": {}
+        }))
+        rep = msgpack.unpackb(ref_socket.recv(), raw=False)
+    update_lamport(rep.get("lamport_clock", 0))
+    return rep.get("payload", {}).get("servers", [])
+
+# Socket PUB exclusivo para anunciar o coordenador (só é usado dentro de election_lock)
+announce_socket = context.socket(zmq.PUB)
+announce_socket.connect(PROXY_PUB_ADDR)
+
+def announce_coordinator():
+    global coordinator
+    coordinator = SERVER_ID
+    msg = {
+        "type": "COORDINATOR_PUB",
+        "sender": SERVER_ID,
+        "timestamp": now_ts(),
+        "lamport_clock": increment_lamport(),
+        "payload": {"coordinator": SERVER_ID}
+    }
+    log_event("ENVIO", {**msg, "type": f"PUB [{SERVERS_TOPIC}]"})
+    announce_socket.send_multipart([SERVERS_TOPIC.encode("utf-8"), msgpack.packb(msg)])
+    print(f"[{SERVER_ID}] Eleito como COORDENADOR.", flush=True)
+
+def start_election():
+    """Algoritmo do valentão: pede eleição aos servidores de rank maior."""
+    if not election_lock.acquire(blocking=False):
+        return  # já existe uma eleição em andamento neste servidor
+    try:
+        print(f"[{SERVER_ID}] Iniciando eleicao (rank {server_rank}).", flush=True)
+        higher = [s for s in ref_list_servers() if s["rank"] > server_rank]
+        for s in sorted(higher, key=lambda x: x["rank"]):
+            rep = peer_request(s["name"], "ELECTION_REQ", {"rank": server_rank})
+            if rep and rep.get("payload", {}).get("status") == "OK":
+                print(f"[{SERVER_ID}] '{s['name']}' (rank maior) assumiu a eleicao.", flush=True)
+                return
+        announce_coordinator()
+    except Exception as e:
+        print(f"[{SERVER_ID}] Erro na eleicao: {e}", flush=True)
+    finally:
+        election_lock.release()
+
+def sync_clock():
+    """Berkeley: pede a hora correta ao coordenador e ajusta o relógio local."""
+    global clock_offset
+    if coordinator is None:
+        start_election()
+        return
+    if coordinator == SERVER_ID:
+        print(f"[{SERVER_ID}] Sou o coordenador: relogio de referencia ({now_ts()}).", flush=True)
+        return
+    t0 = time.time()
+    rep = peer_request(coordinator, "CLOCK_REQ", {"local_time": now_time()})
+    t1 = time.time()
+    if rep is None:
+        print(f"[{SERVER_ID}] Coordenador '{coordinator}' indisponivel. Pedindo eleicao.", flush=True)
+        start_election()
+        return
+    coord_time = rep.get("payload", {}).get("time")
+    if coord_time is None:
+        return
+    correct = coord_time + (t1 - t0) / 2          # compensa metade do RTT
+    adjust = correct - now_time()
+    clock_offset += adjust
+    print(f"[{SERVER_ID}] Relogio sincronizado com '{coordinator}'. Ajuste: {adjust:+.3f}s", flush=True)
+
+def peer_loop():
+    """Atende REQs de outros servidores: relógio (coordenador) e eleição."""
+    sock = context.socket(zmq.REP)
+    sock.bind(f"tcp://*:{PEER_PORT}")
+    while True:
+        request = msgpack.unpackb(sock.recv(), raw=False)
+        update_lamport(request.get("lamport_clock", 0))
+        log_event("RECEBIMENTO", request)
+        req_type = request.get("type")
+        start_new_election = False
+
+        if req_type == "CLOCK_REQ":
+            reply_payload = {"status": "OK", "time": now_time()}
+        elif req_type == "ELECTION_REQ":
+            reply_payload = {"status": "OK"}
+            start_new_election = True
+        else:
+            reply_payload = {"status": "ERROR", "msg": "Requisicao desconhecida"}
+
+        response = {
+            "type": f"{req_type}_REP",
+            "sender": SERVER_ID,
+            "timestamp": now_ts(),
+            "lamport_clock": increment_lamport(),
+            "payload": reply_payload
+        }
+        log_event("ENVIO", response)
+        sock.send(msgpack.packb(response))
+        if start_new_election:
+            threading.Thread(target=start_election, daemon=True).start()
+
+def servers_listener():
+    """Assina o tópico 'servers' e guarda o nome do coordenador eleito."""
+    global coordinator
+    sub = context.socket(zmq.SUB)
+    sub.connect(PROXY_SUB_ADDR)
+    sub.setsockopt_string(zmq.SUBSCRIBE, SERVERS_TOPIC)
+    while True:
+        topic, raw = sub.recv_multipart()
+        msg = msgpack.unpackb(raw, raw=False)
+        update_lamport(msg.get("lamport_clock", 0))
+        log_event("RECEBIMENTO", {**msg, "type": f"PUB [{topic.decode()}]"})
+        coordinator = msg.get("payload", {}).get("coordinator")
+        print(f"[{SERVER_ID}] Coordenador atual: {coordinator}", flush=True)
+
+threading.Thread(target=peer_loop, daemon=True).start()
+threading.Thread(target=servers_listener, daemon=True).start()
+time.sleep(1)  # dá tempo da assinatura do tópico propagar pelo proxy
+threading.Thread(target=start_election, daemon=True).start()
 
 while True:
     raw_msg = rep_socket.recv()
@@ -139,7 +314,7 @@ while True:
                 "sender": sender,
                 "text": msg_text,
                 "sent_timestamp": request.get("timestamp"),
-                "server_timestamp": int(time.time()),
+                "server_timestamp": now_ts(),
                 "lamport_clock": lamport_clock
             }
             messages.append(msg_record)
@@ -174,9 +349,16 @@ while True:
     response = {
         "type": f"{req_type}_REP",
         "sender": SERVER_ID,
-        "timestamp": int(time.time()),
+        "timestamp": now_ts(),
         "lamport_clock": send_clock,
         "payload": reply_payload
     }
     log_event("ENVIO", response)
     rep_socket.send(msgpack.packb(response))
+
+    # Parte 4: a cada 15 mensagens, sincroniza o relógio com o coordenador
+    # (feito depois do reply para não atrasar o cliente caso ocorra uma eleição)
+    sync_counter += 1
+    if sync_counter >= SYNC_EVERY:
+        sync_counter = 0
+        sync_clock()
