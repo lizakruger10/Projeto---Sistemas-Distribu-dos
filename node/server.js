@@ -2,6 +2,7 @@ const zmq = require('zeromq');
 const { encode, decode } = require('@msgpack/msgpack');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const SERVER_ID = process.env.SERVER_ID || 'server_node_1';
 const BROKER_ADDR = process.env.BROKER_ADDR || 'tcp://broker:5556';
@@ -14,6 +15,8 @@ const CLOCK_SKEW = parseFloat(process.env.CLOCK_SKEW || '0'); // defasagem inici
 const SERVERS_TOPIC = 'servers';
 const SYNC_EVERY = 15;                                      // sincroniza o relógio a cada 15 mensagens
 const PEER_TIMEOUT_MS = 2000;
+const SYNC_INTERVAL = 20000;                               // Parte 5: intervalo da sincronização (anti-entropia) entre réplicas
+const PEER_DOWN_MS = 10000;                                 // Parte 5: tempo sem tentar replicar para um servidor que não respondeu
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -36,6 +39,45 @@ function saveJson(filepath, data) {
 }
 
 const { logins, channels, messages } = loadData();
+
+// Parte 5: todo registro tem um id único (permite eliminar duplicatas ao replicar)
+for (const rec of [...logins, ...messages]) {
+  if (!rec.id) rec.id = crypto.randomUUID();
+}
+const loginIds = new Set(logins.map(l => l.id));
+const messageIds = new Set(messages.map(m => m.id));
+
+// mesma ordem em todos os servidores: relógio lógico e, em caso de empate, o id
+function messageCmp(a, b) {
+  const d = (a.lamport_clock || 0) - (b.lamport_clock || 0);
+  if (d !== 0) return d;
+  return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+}
+messages.sort(messageCmp);
+
+function addLogin(rec) {
+  if (loginIds.has(rec.id)) return false;
+  loginIds.add(rec.id);
+  logins.push(rec);
+  saveJson(LOGINS_FILE, logins);
+  return true;
+}
+
+function addChannel(name) {
+  if (channels.includes(name)) return false;
+  channels.push(name);
+  saveJson(CHANNELS_FILE, channels);
+  return true;
+}
+
+function addMessage(rec) {
+  if (messageIds.has(rec.id)) return false;
+  messageIds.add(rec.id);
+  messages.push(rec);
+  messages.sort(messageCmp);
+  saveJson(MESSAGES_FILE, messages);
+  return true;
+}
 
 let lamportClock = 0;
 let msgCounter = 0;
@@ -66,7 +108,9 @@ function logEvent(action, msgData) {
   console.log(`Origem: ${msgData.sender}`);
   console.log(`Relogio Logico (Lamport): ${msgData.lamport_clock}`);
   console.log(`Timestamp: ${msgData.timestamp}`);
-  console.log(`Payload: ${JSON.stringify(msgData.payload)}`);
+  let payloadStr = JSON.stringify(msgData.payload);
+  if (payloadStr && payloadStr.length > 500) payloadStr = `${payloadStr.slice(0, 500)}... (${payloadStr.length} caracteres)`;
+  console.log(`Payload: ${payloadStr}`);
   console.log('='.repeat(60));
 }
 
@@ -201,7 +245,106 @@ async function syncClock() {
   console.log(`[${SERVER_ID}] Relogio sincronizado com '${coordinator}'. Ajuste: ${adjust >= 0 ? '+' : ''}${adjust.toFixed(3)}s`);
 }
 
-// Atende REQs de outros servidores: relógio (coordenador) e eleição
+// ======================= PARTE 5: REPLICAÇÃO =======================
+// Replicação ativa (multi-master): o servidor que recebe a requisição do cliente
+// aplica localmente e repassa o registro a todos os outros servidores (REPLICATE_REQ).
+// Para recuperar o que foi perdido (servidor novo/reiniciado ou falha de rede), cada
+// servidor também faz sincronização periódica (SYNC_REQ) trocando apenas o que falta.
+
+const replicationQueue = [];
+const peerDownUntil = {};
+let replicating = false;
+
+function replicate(kind, record) {
+  replicationQueue.push({ kind, record });
+  if (!replicating) drainReplication();
+}
+
+async function otherServers() {
+  try {
+    const rep = await refCall({
+      type: 'LIST_SERVERS_REQ',
+      sender: SERVER_ID,
+      timestamp: nowTs(),
+      lamport_clock: incrementLamport(),
+      payload: {}
+    });
+    updateLamport(rep.lamport_clock);
+    return (rep.payload?.servers || []).map(s => s.name).filter(n => n !== SERVER_ID);
+  } catch (err) {
+    console.error(`[${SERVER_ID}] Erro ao listar servidores:`, err.message);
+    return [];
+  }
+}
+
+async function drainReplication() {
+  replicating = true;
+  try {
+    while (replicationQueue.length > 0) {
+      const { kind, record } = replicationQueue.shift();
+      for (const name of await otherServers()) {
+        if ((peerDownUntil[name] || 0) > Date.now()) continue; // será recuperado pela sincronização periódica
+        const rep = await peerRequest(name, 'REPLICATE_REQ', { kind, record });
+        if (rep === null) peerDownUntil[name] = Date.now() + PEER_DOWN_MS;
+      }
+    }
+  } catch (err) {
+    console.error(`[${SERVER_ID}] Erro na replicacao:`, err.message);
+  } finally {
+    replicating = false;
+  }
+}
+
+function handleReplicate(payload) {
+  const { kind, record } = payload;
+  if (kind === 'message' && record) addMessage(record);
+  else if (kind === 'login' && record) addLogin(record);
+  else if (kind === 'channel' && record) addChannel(record);
+  else return { status: 'ERROR', msg: 'Replicacao invalida' };
+  return { status: 'OK' };
+}
+
+function handleSync(payload) {
+  const haveLogins = new Set(payload.login_ids || []);
+  const haveMessages = new Set(payload.message_ids || []);
+  for (const ch of payload.channels || []) addChannel(ch);
+  return {
+    status: 'OK',
+    logins: logins.filter(l => !haveLogins.has(l.id)),
+    messages: messages.filter(m => !haveMessages.has(m.id)),
+    channels: [...channels]
+  };
+}
+
+async function syncWithPeers() {
+  for (const name of await otherServers()) {
+    const rep = await peerRequest(name, 'SYNC_REQ', {
+      login_ids: logins.map(l => l.id),
+      message_ids: messages.map(m => m.id),
+      channels: [...channels]
+    });
+    if (!rep || rep.payload?.status !== 'OK') continue;
+    let novos = 0;
+    for (const l of rep.payload.logins || []) if (addLogin(l)) novos++;
+    for (const m of rep.payload.messages || []) if (addMessage(m)) novos++;
+    for (const c of rep.payload.channels || []) if (addChannel(c)) novos++;
+    if (novos > 0) console.log(`[${SERVER_ID}] Sincronizacao com '${name}': ${novos} registro(s) recebido(s).`);
+  }
+}
+
+async function runSyncLoop() {
+  await new Promise(res => setTimeout(res, 3000)); // espera os outros servidores se registrarem
+  while (true) {
+    try {
+      await syncWithPeers();
+    } catch (err) {
+      console.error(`[${SERVER_ID}] Erro na sincronizacao:`, err.message);
+    }
+    await new Promise(res => setTimeout(res, SYNC_INTERVAL));
+  }
+}
+
+// Atende REQs de outros servidores: relógio (coordenador), eleição e replicação
 async function runPeerServer() {
   const sock = new zmq.Reply();
   await sock.bind(`tcp://*:${PEER_PORT}`);
@@ -219,6 +362,10 @@ async function runPeerServer() {
       } else if (reqType === 'ELECTION_REQ') {
         replyPayload = { status: 'OK' };
         startNewElection = true;
+      } else if (reqType === 'REPLICATE_REQ') {
+        replyPayload = handleReplicate(request.payload || {});
+      } else if (reqType === 'SYNC_REQ') {
+        replyPayload = handleSync(request.payload || {});
       } else {
         replyPayload = { status: 'ERROR', msg: 'Requisicao desconhecida' };
       }
@@ -279,6 +426,7 @@ async function runServer() {
   announceSocket.connect(PROXY_PUB_ADDR);
   runPeerServer().catch(console.error);
   runServersListener().catch(console.error);
+  runSyncLoop().catch(console.error);
   await new Promise(res => setTimeout(res, 1000)); // assinatura propagar pelo proxy
   startElection();
 
@@ -296,8 +444,9 @@ async function runServer() {
       if (reqType === 'LOGIN_REQ') {
         const user = payload.user;
         if (user) {
-          logins.push({ user, timestamp: request.timestamp });
-          saveJson(LOGINS_FILE, logins);
+          const loginRec = { id: crypto.randomUUID(), user, timestamp: request.timestamp };
+          addLogin(loginRec);
+          replicate('login', loginRec);
           replyPayload = { status: 'OK', msg: `Bem-vindo ${user}` };
         } else {
           replyPayload = { status: 'ERROR', msg: 'Usuario invalido' };
@@ -306,8 +455,8 @@ async function runServer() {
       } else if (reqType === 'CREATE_CHANNEL_REQ') {
         const chName = payload.channel;
         if (chName && !channels.includes(chName)) {
-          channels.push(chName);
-          saveJson(CHANNELS_FILE, channels);
+          addChannel(chName);
+          replicate('channel', chName);
           replyPayload = { status: 'OK', msg: `Canal '${chName}' criado` };
         } else {
           replyPayload = { status: 'ERROR', msg: 'Canal invalido ou existente' };
@@ -322,6 +471,7 @@ async function runServer() {
 
         if (targetChannel && msgText) {
           const msgRecord = {
+            id: crypto.randomUUID(),
             channel: targetChannel,
             sender,
             text: msgText,
@@ -329,8 +479,8 @@ async function runServer() {
             server_timestamp: nowTs(),
             lamport_clock: lamportClock
           };
-          messages.push(msgRecord);
-          saveJson(MESSAGES_FILE, messages);
+          addMessage(msgRecord);
+          replicate('message', msgRecord);
 
           const pubClock = incrementLamport();
           const pubPacket = {
