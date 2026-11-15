@@ -2,6 +2,9 @@ import os
 import time
 import json
 import threading
+import queue
+import uuid
+import bisect
 import zmq
 import msgpack
 
@@ -16,6 +19,8 @@ CLOCK_SKEW = float(os.getenv("CLOCK_SKEW", "0"))    # defasagem inicial do reló
 SERVERS_TOPIC = "servers"
 SYNC_EVERY = 15                                     # sincroniza o relógio a cada 15 mensagens
 PEER_TIMEOUT_MS = 2000
+SYNC_INTERVAL = 20                                  # Parte 5: intervalo da sincronização (anti-entropia) entre réplicas
+PEER_DOWN_SECONDS = 10                              # Parte 5: tempo sem tentar replicar para um servidor que não respondeu
 
 os.makedirs(DATA_DIR, exist_ok=True)
 LOGINS_FILE = os.path.join(DATA_DIR, f"{SERVER_ID}_logins.json")
@@ -37,6 +42,45 @@ def save_json(filepath, data):
         json.dump(data, f, indent=2)
 
 logins, channels, messages = load_data()
+
+# Parte 5: todo registro tem um id único (permite eliminar duplicatas ao replicar)
+for _rec in logins + messages:
+    _rec.setdefault("id", uuid.uuid4().hex)
+login_ids = {l["id"] for l in logins}
+message_ids = {m["id"] for m in messages}
+data_lock = threading.RLock()
+
+def message_key(m):
+    # mesma ordem em todos os servidores: relógio lógico e, em caso de empate, o id
+    return (m.get("lamport_clock", 0), m["id"])
+
+messages.sort(key=message_key)
+
+def add_login(rec):
+    with data_lock:
+        if rec["id"] in login_ids:
+            return False
+        login_ids.add(rec["id"])
+        logins.append(rec)
+        save_json(LOGINS_FILE, logins)
+        return True
+
+def add_channel(name):
+    with data_lock:
+        if name in channels:
+            return False
+        channels.append(name)
+        save_json(CHANNELS_FILE, channels)
+        return True
+
+def add_message(rec):
+    with data_lock:
+        if rec["id"] in message_ids:
+            return False
+        message_ids.add(rec["id"])
+        bisect.insort(messages, rec, key=message_key)
+        save_json(MESSAGES_FILE, messages)
+        return True
 
 # Estado Distribuído (Lamport Clock e Heartbeat)
 lamport_clock = 0
@@ -116,7 +160,10 @@ def log_event(action, msg_data):
     print(f"Origem: {msg_data.get('sender')}", flush=True)
     print(f"Relogio Logico (Lamport): {msg_data.get('lamport_clock')}", flush=True)
     print(f"Timestamp: {msg_data.get('timestamp')}", flush=True)
-    print(f"Payload: {msg_data.get('payload')}", flush=True)
+    payload_str = str(msg_data.get('payload'))
+    if len(payload_str) > 500:
+        payload_str = payload_str[:500] + f"... ({len(payload_str)} caracteres)"
+    print(f"Payload: {payload_str}", flush=True)
     print("=" * 60, flush=True)
 
 # ======================= PARTE 4: ELEIÇÃO E SINCRONIZAÇÃO =======================
@@ -237,6 +284,10 @@ def peer_loop():
         elif req_type == "ELECTION_REQ":
             reply_payload = {"status": "OK"}
             start_new_election = True
+        elif req_type == "REPLICATE_REQ":
+            reply_payload = handle_replicate(request.get("payload", {}))
+        elif req_type == "SYNC_REQ":
+            reply_payload = handle_sync(request.get("payload", {}))
         else:
             reply_payload = {"status": "ERROR", "msg": "Requisicao desconhecida"}
 
@@ -251,6 +302,87 @@ def peer_loop():
         sock.send(msgpack.packb(response))
         if start_new_election:
             threading.Thread(target=start_election, daemon=True).start()
+
+# ======================= PARTE 5: REPLICAÇÃO =======================
+# Replicação ativa (multi-master): o servidor que recebe a requisição do cliente
+# aplica localmente e repassa o registro a todos os outros servidores (REPLICATE_REQ).
+# Para recuperar o que foi perdido (servidor novo/reiniciado ou falha de rede), cada
+# servidor também faz sincronização periódica (SYNC_REQ) trocando apenas o que falta.
+
+replication_queue = queue.Queue()
+peer_down_until = {}
+
+def replicate(kind, record):
+    replication_queue.put((kind, record))
+
+def other_servers():
+    try:
+        return [s["name"] for s in ref_list_servers() if s["name"] != SERVER_ID]
+    except Exception as e:
+        print(f"[{SERVER_ID}] Erro ao listar servidores: {e}", flush=True)
+        return []
+
+def replication_loop():
+    while True:
+        kind, record = replication_queue.get()
+        for name in other_servers():
+            if peer_down_until.get(name, 0) > time.time():
+                continue  # será recuperado pela sincronização periódica
+            rep = peer_request(name, "REPLICATE_REQ", {"kind": kind, "record": record})
+            if rep is None:
+                peer_down_until[name] = time.time() + PEER_DOWN_SECONDS
+
+def handle_replicate(payload):
+    kind, record = payload.get("kind"), payload.get("record")
+    if kind == "message" and record:
+        add_message(record)
+    elif kind == "login" and record:
+        add_login(record)
+    elif kind == "channel" and record:
+        add_channel(record)
+    else:
+        return {"status": "ERROR", "msg": "Replicacao invalida"}
+    return {"status": "OK"}
+
+def handle_sync(payload):
+    have_logins = set(payload.get("login_ids", []))
+    have_messages = set(payload.get("message_ids", []))
+    for ch in payload.get("channels", []):
+        add_channel(ch)
+    with data_lock:
+        return {
+            "status": "OK",
+            "logins": [l for l in logins if l["id"] not in have_logins],
+            "messages": [m for m in messages if m["id"] not in have_messages],
+            "channels": list(channels)
+        }
+
+def sync_with_peers():
+    for name in other_servers():
+        with data_lock:
+            payload = {
+                "login_ids": [l["id"] for l in logins],
+                "message_ids": [m["id"] for m in messages],
+                "channels": list(channels)
+            }
+        rep = peer_request(name, "SYNC_REQ", payload)
+        if not rep or rep.get("payload", {}).get("status") != "OK":
+            continue
+        data = rep["payload"]
+        new = sum(add_login(l) for l in data.get("logins", []))
+        new += sum(add_message(m) for m in data.get("messages", []))
+        new += sum(add_channel(c) for c in data.get("channels", []))
+        if new:
+            print(f"[{SERVER_ID}] Sincronizacao com '{name}': {new} registro(s) recebido(s).", flush=True)
+
+def sync_loop():
+    time.sleep(3)  # espera os outros servidores se registrarem
+    while True:
+        try:
+            sync_with_peers()
+        except Exception as e:
+            print(f"[{SERVER_ID}] Erro na sincronizacao: {e}", flush=True)
+        time.sleep(SYNC_INTERVAL)
 
 def servers_listener():
     """Assina o tópico 'servers' e guarda o nome do coordenador eleito."""
@@ -268,6 +400,8 @@ def servers_listener():
 
 threading.Thread(target=peer_loop, daemon=True).start()
 threading.Thread(target=servers_listener, daemon=True).start()
+threading.Thread(target=replication_loop, daemon=True).start()
+threading.Thread(target=sync_loop, daemon=True).start()
 time.sleep(1)  # dá tempo da assinatura do tópico propagar pelo proxy
 threading.Thread(target=start_election, daemon=True).start()
 
@@ -286,8 +420,9 @@ while True:
     if req_type == "LOGIN_REQ":
         user = payload.get("user")
         if user:
-            logins.append({"user": user, "timestamp": request.get("timestamp")})
-            save_json(LOGINS_FILE, logins)
+            login_rec = {"id": uuid.uuid4().hex, "user": user, "timestamp": request.get("timestamp")}
+            add_login(login_rec)
+            replicate("login", login_rec)
             reply_payload = {"status": "OK", "msg": f"Bem-vindo {user}"}
         else:
             reply_payload = {"status": "ERROR", "msg": "Usuario invalido"}
@@ -295,8 +430,8 @@ while True:
     elif req_type == "CREATE_CHANNEL_REQ":
         ch_name = payload.get("channel")
         if ch_name and ch_name not in channels:
-            channels.append(ch_name)
-            save_json(CHANNELS_FILE, channels)
+            add_channel(ch_name)
+            replicate("channel", ch_name)
             reply_payload = {"status": "OK", "msg": f"Canal '{ch_name}' criado"}
         else:
             reply_payload = {"status": "ERROR", "msg": "Canal invalido ou existente"}
@@ -310,6 +445,7 @@ while True:
 
         if target_channel and msg_text:
             msg_record = {
+                "id": uuid.uuid4().hex,
                 "channel": target_channel,
                 "sender": sender,
                 "text": msg_text,
@@ -317,8 +453,8 @@ while True:
                 "server_timestamp": now_ts(),
                 "lamport_clock": lamport_clock
             }
-            messages.append(msg_record)
-            save_json(MESSAGES_FILE, messages)
+            add_message(msg_record)
+            replicate("message", msg_record)
 
             pub_clock = increment_lamport()
             pub_packet = {
