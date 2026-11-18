@@ -90,6 +90,3 @@ Os servidores escolhem um coordenador entre si, e ele passa a fornecer a hora ao
 - **Ordem:** as mensagens ficam ordenadas por (relógio de Lamport, id), então todos os servidores têm o mesmo histórico na mesma ordem.
 - **Falhas:** um servidor que não responde é ignorado por 10 s e depois recuperado pelo `SYNC_REQ`.
 
-**Mudanças em relação ao método teórico:**
-- Em vez de ordem total das escritas (multicast ordenado ou consenso), foi usada consistência eventual com ordem determinística, o que basta para um histórico de mensagens.
-- Foi acrescentada a sincronização periódica, porque enviar a todos não cobre servidores que estavam fora do ar.
